@@ -1,0 +1,24 @@
+{
+  "name": "moderation-guard",
+  "version": "1.0.0",
+  "description": "AI-powered content moderation primitive on GenLayer.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anaraydinli55/moderation-guard.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/anaraydinli55/moderation-guard/issues"
+  },
+  "homepage": "https://github.com/anaraydinli55/moderation-guard#readme",
+  "dependencies": {
+    "genlayer-js": "^2.0.0-rc.1",
+    "viem": "^2.56.3"
+  }
+}
