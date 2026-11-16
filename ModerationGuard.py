@@ -14,13 +14,12 @@ class ModerationGuard(gl.contract.Contract):
     def __init__(self):
         self.owner = "0xCCF031DC9541d1771F5BFfCeF07D9b3bDd168f4f"
 
-        # Explicit On-Chain Policy Rules
         default_policies = {
             "POL_MALWARE_PHISHING": {
                 "name": "Malware, Phishing & Deceptive Software",
                 "severity": "CRITICAL",
                 "strike_penalty": 3,
-                "description": "Content distributes harmful binaries, impersonates trusted login portals, or captures credentials."
+                "description": "Content distributes harmful binaries, impersonates trusted portals, or captures credentials."
             },
             "POL_FINANCIAL_SCAM": {
                 "name": "Financial Fraud & Deceptive Schemes",
@@ -38,7 +37,7 @@ class ModerationGuard(gl.contract.Contract):
                 "name": "Flagrant Copyright & Asset Theft",
                 "severity": "LOW",
                 "strike_penalty": 1,
-                "description": "Unauthorized direct mirroring of copyrighted commercial media or counterfeit brand assets."
+                "description": "Unauthorized direct mirroring of copyrighted media or counterfeit brand assets."
             }
         }
         self.policies_json = json.dumps(default_policies)
@@ -47,7 +46,7 @@ class ModerationGuard(gl.contract.Contract):
         self.challenges_json = json.dumps({})
 
     # -------------------------------------------------------------
-    # WRITE: Consensus-Bound Policy Audit
+    # WRITE: Consensus-Bound Policy Audit (Independent Re-fetch & Re-eval)
     # -------------------------------------------------------------
     @gl.public.write
     def audit_content(self, target_url: str, policy_id: str) -> str:
@@ -57,61 +56,58 @@ class ModerationGuard(gl.contract.Contract):
 
         policy = policies[policy_id]
 
-        def leader_fn():
-            # 1. Independent Evidence Extraction
-            content_sample = ""
+        def _fetch_and_eval(url: str, pol_name: str, pol_desc: str) -> str:
+            content = ""
             try:
-                rendered = str(gl.nondet.web.render(target_url, mode="text"))
-                content_sample = rendered[:2500]
+                resp = gl.nondet.web.get(url)
+                content = (resp.body or b"")[:3000].decode("utf-8", errors="ignore")
             except Exception:
-                try:
-                    resp = gl.nondet.web.get(target_url)
-                    content_sample = (resp.body or b"")[:2500].decode("utf-8", errors="ignore")
-                except Exception:
-                    content_sample = "[CONTENT_UNREACHABLE]"
+                return "UNVERIFIABLE"
 
-            if not content_sample or content_sample == "[CONTENT_UNREACHABLE]":
-                return json.dumps({
-                    "verdict": "UNVERIFIABLE",
-                    "violation": False,
-                    "reason": "Target content could not be fetched or rendered by validators."
-                })
+            if not content:
+                return "UNVERIFIABLE"
 
-            # 2. Multi-Vector Policy Evaluation
             prompt = (
-                f"You are a strict decentralized consensus moderation validator.\n"
-                f"Examine the target text against the following policy:\n"
-                f"POLICY: {policy['name']}\n"
-                f"POLICY DESCRIPTION: {policy['description']}\n\n"
-                f"CONTENT TO EVALUATE:\n'''{content_sample}'''\n\n"
-                f"Answer strictly with a single JSON object without formatting or markdown:\n"
-                f'{{"violation": true/false, "verdict": "SAFE" or "VIOLATION", "reason": "<brief_reason_max_20_words>"}}'
+                f"You are an impartial decentralized content moderation validator.\n"
+                f"Policy Name: {pol_name}\n"
+                f"Policy Rule: {pol_desc}\n\n"
+                f"Web Content Sample:\n'''{content}'''\n\n"
+                f"Does this web content violate the specified policy rule?\n"
+                f"Answer strictly with a single uppercase word: VIOLATION or SAFE."
             )
-            raw_eval = str(gl.nondet.exec_prompt(prompt)).strip()
-            return raw_eval
+            res = str(gl.nondet.exec_prompt(prompt)).strip().upper()
+            if "VIOLATION" in res:
+                return "VIOLATION"
+            return "SAFE"
 
+        # 1. Leader independently fetches evidence and evaluates
+        def leader_fn() -> str:
+            return _fetch_and_eval(target_url, policy["name"], policy["description"])
+
+        # 2. Validator independently re-fetches evidence and re-evaluates
         def validator_fn(lr) -> bool:
-            return isinstance(lr, gl.vm.Return)
+            if not isinstance(lr, gl.vm.Return):
+                return False
 
-        evaluation_raw = gl.vm.run_nondet(leader_fn, validator_fn)
+            # lr.calldata contains the leader return value
+            leader_verdict = lr.calldata
 
-        try:
-            eval_data = json.loads(evaluation_raw)
-        except Exception:
-            eval_data = {"verdict": "UNVERIFIABLE", "violation": False, "reason": "Malformed LLM output"}
+            # Validator independently re-fetches and re-evaluates
+            validator_verdict = _fetch_and_eval(target_url, policy["name"], policy["description"])
+            return leader_verdict == validator_verdict
+
+        verdict = gl.vm.run_nondet(leader_fn, validator_fn)
+        is_violation = (verdict == "VIOLATION")
 
         audits = json.loads(self.audits_json)
         strikes = json.loads(self.strikes_json)
 
         current_strikes = strikes.get(target_url, 0)
-        is_violation = eval_data.get("violation", False)
-
         if is_violation:
             penalty = policy.get("strike_penalty", 1)
             current_strikes += penalty
             strikes[target_url] = current_strikes
 
-        # Concrete Restriction State
         status = "CLEAN"
         if current_strikes >= 3:
             status = "BLACKLISTED"
@@ -120,68 +116,70 @@ class ModerationGuard(gl.contract.Contract):
         elif current_strikes == 1:
             status = "FLAGGED"
 
-        audits[target_url] = {
-            "last_policy": policy_id,
-            "verdict": eval_data.get("verdict", "UNVERIFIABLE"),
+        record = {
+            "target": target_url,
+            "policy": policy_id,
+            "verdict": verdict,
             "is_violation": is_violation,
-            "reasoning": eval_data.get("reason", "No reasoning"),
             "status": status,
             "strikes": current_strikes
         }
 
+        audits[target_url] = record
         self.audits_json = json.dumps(audits)
         self.strikes_json = json.dumps(strikes)
-        return json.dumps(audits[target_url])
+        return json.dumps(record)
 
     # -------------------------------------------------------------
-    # WRITE: Multi-Party Dispute & Challenge Logic
+    # WRITE: Multi-Party Dispute (Independent Appeal Consensus)
     # -------------------------------------------------------------
     @gl.public.write
     def challenge_verdict(self, target_url: str, claim_type: str, justification: str) -> str:
-        """
-        claim_type: FALSE_POSITIVE | REMEDIATED | AUTHORIZED_EXCEPTION
-        """
         audits = json.loads(self.audits_json)
         if target_url not in audits:
-            raise gl.vm.UserError(f"No active moderation record found for {target_url}")
+            raise gl.vm.UserError(f"No active record for {target_url}")
 
         record = audits[target_url]
         if not record.get("is_violation", False):
-            raise gl.vm.UserError(f"Target {target_url} has no recorded violation to appeal.")
+            raise gl.vm.UserError(f"No recorded violation to appeal for {target_url}")
 
-        def leader_challenge_eval():
+        def _eval_appeal(url: str, claim: str, just: str) -> str:
             live_text = ""
             try:
-                live_text = str(gl.nondet.web.render(target_url, mode="text"))[:2000]
+                resp = gl.nondet.web.get(url)
+                live_text = (resp.body or b"")[:3000].decode("utf-8", errors="ignore")
             except Exception:
-                live_text = "[UNABLE_TO_VERIFY_LIVE_STATUS]"
+                return "UPHELD"
 
             prompt = (
-                f"You are a judicial appeals validator for decentralized moderation.\n"
-                f"Original Violation Reason: {record.get('reasoning')}\n"
-                f"Appellant Claim Type: {claim_type}\n"
-                f"Appellant Justification: {justification}\n"
-                f"Current Live Content Snapshot: '''{live_text}'''\n\n"
-                f"Determine whether this appeal is justified and should overturn or mitigate the penalty.\n"
-                f"Reply strictly with JSON:\n"
-                f'{{"overturn": true/false, "decision": "UPHELD" or "OVERTURNED", "appeal_summary": "<max_20_words>"}}'
+                f"You are an impartial judicial appeals validator for content moderation.\n"
+                f"Appellant Claim Type: {claim}\n"
+                f"Appellant Justification: {just}\n"
+                f"Live Page Content:\n'''{live_text}'''\n\n"
+                f"Should the moderation penalty be overturned based on this claim?\n"
+                f"Answer strictly with a single uppercase word: OVERTURN or UPHOLD."
             )
-            return str(gl.nondet.exec_prompt(prompt)).strip()
+            res = str(gl.nondet.exec_prompt(prompt)).strip().upper()
+            if "OVERTURN" in res:
+                return "OVERTURN"
+            return "UPHELD"
 
-        def validator_fn(lr) -> bool:
-            return isinstance(lr, gl.vm.Return)
+        def leader_appeal_fn() -> str:
+            return _eval_appeal(target_url, claim_type, justification)
 
-        appeal_eval_raw = gl.vm.run_nondet(leader_challenge_eval, validator_fn)
+        def validator_appeal_fn(lr) -> bool:
+            if not isinstance(lr, gl.vm.Return):
+                return False
+            leader_decision = lr.calldata
+            validator_decision = _eval_appeal(target_url, claim_type, justification)
+            return leader_decision == validator_decision
 
-        try:
-            appeal_res = json.loads(appeal_eval_raw)
-        except Exception:
-            appeal_res = {"overturn": False, "decision": "UPHELD", "appeal_summary": "Evaluation parse failure"}
+        decision = gl.vm.run_nondet(leader_appeal_fn, validator_appeal_fn)
 
         strikes = json.loads(self.strikes_json)
         challenges = json.loads(self.challenges_json)
 
-        if appeal_res.get("overturn", False):
+        if decision == "OVERTURN":
             strikes[target_url] = max(0, strikes.get(target_url, 0) - 2)
             record["is_violation"] = False
             record["status"] = "CLEAN" if strikes[target_url] == 0 else "FLAGGED"
@@ -189,13 +187,11 @@ class ModerationGuard(gl.contract.Contract):
         else:
             record["verdict"] = "APPEAL_REJECTED"
 
-        record["last_appeal"] = appeal_res
-
+        record["last_appeal"] = decision
         audits[target_url] = record
         challenges[target_url] = {
             "claim_type": claim_type,
-            "decision": appeal_res.get("decision"),
-            "summary": appeal_res.get("appeal_summary")
+            "decision": decision
         }
 
         self.audits_json = json.dumps(audits)
@@ -215,7 +211,6 @@ class ModerationGuard(gl.contract.Contract):
     def get_compliance_report(self, target_url: str) -> str:
         audits = json.loads(self.audits_json)
         return json.dumps(audits.get(target_url, {
-            "target": target_url,
             "status": "UNAUDITED",
             "strikes": 0
         }))
